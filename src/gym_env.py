@@ -27,12 +27,20 @@ class Game2048Env(gym.Env):
     ):
         super().__init__()
         self.action_space = spaces.Discrete(4)
-        self.observation_space = spaces.Box(low=0, high=16, shape=(16,), dtype=np.float32)
+        self.observation_space = spaces.Box(low=0, high=16, shape=(17,), dtype=np.float32)
         self.game = Game2048()
         self.last_score = 0
         self.last_max_tile = 0
         self.reward_variant = reward_variant
-        # Reward weights (can be swept)
+        # Reward weights (all in a dictionary for transparency)
+        self.reward_weights = {
+            'max_in_corner': 5.0,      # Reward for max in corner
+            'not_in_corner': -2.0,     # Penalty for not in corner
+            'moved_out_of_corner': -30.0, # Strong penalty for moving max out of corner
+            'max_tile_increased': 15.0,       # Bonus for increasing max tile
+            'combine_top_two': 10.0    # Bonus for combining the two highest tiles
+        }
+        # ...existing code for other weights...
         self.empty_tile_weight = empty_tile_weight
         self.monotonicity_weight = monotonicity_weight
         self.corner_bonus = corner_bonus
@@ -42,6 +50,8 @@ class Game2048Env(gym.Env):
         self.milestone_4096 = milestone_4096
         self.move_penalty = move_penalty
         self.lose_penalty = lose_penalty
+        # --- Metrics tracking ---
+        self.episode_metrics = None
 
     def set_reward_variant(self, variant):
         self.reward_variant = variant
@@ -49,8 +59,73 @@ class Game2048Env(gym.Env):
     def set_reward_weights(self, **kwargs):
         # Dynamically update reward weights
         for k, v in kwargs.items():
-            if hasattr(self, k):
+            if k in self.reward_weights:
+                self.reward_weights[k] = v
+            elif hasattr(self, k):
                 setattr(self, k, v)
+
+    def _compute_reward(self, board_before, score_before, max_tile_before):
+        board_after = self.game.board
+        max_tile_after = np.max(board_after)
+        bottom_left = (3, 0)
+        max_in_corner = board_after[bottom_left] == max_tile_after
+        reward = 0.0
+        breakdown = {}
+        # Max in corner
+        if max_in_corner:
+            reward += self.reward_weights['max_in_corner']
+            breakdown['max_in_corner'] = self.reward_weights['max_in_corner']
+        else:
+            reward += self.reward_weights['not_in_corner']
+            breakdown['not_in_corner'] = self.reward_weights['not_in_corner']
+        # Only penalize if the max tile was in the bottom-left before, and is not anymore (and the value didn't increase)
+        max_in_corner_before = board_before[bottom_left] == max_tile_before
+        if max_in_corner_before and not max_in_corner and max_tile_after == max_tile_before:
+            reward += self.reward_weights['moved_out_of_corner']
+            breakdown['moved_out_of_corner'] = self.reward_weights['moved_out_of_corner']
+        # Max tile increased
+        if max_tile_after > max_tile_before:
+            reward += self.reward_weights['max_tile_increased']
+            breakdown['max_tile_increased'] = self.reward_weights['max_tile_increased']
+        # Monotonicity reward: only for leftmost column, moving upward, if max is in bottom-left
+        if max_in_corner:
+            left_col = board_after[:, 0]
+            mono_score = sum(left_col[i] >= left_col[i+1] for i in range(3)) / 3.0
+            mono_reward = self.monotonicity_weight * mono_score
+            reward += mono_reward
+            breakdown['monotonicity'] = mono_reward
+        # Reward for combining the two highest tiles possible
+        before_flat = board_before.flatten()
+        after_flat = board_after.flatten()
+        before_sorted = np.sort(before_flat)[::-1]
+        after_sorted = np.sort(after_flat)[::-1]
+        if len(before_sorted) > 1 and len(after_sorted) > 1:
+            before_second = before_sorted[1]
+            after_second = after_sorted[1]
+            if max_tile_after > max_tile_before and after_second < before_second:
+                reward += self.reward_weights['combine_top_two']
+                breakdown['combine_top_two'] = self.reward_weights['combine_top_two']
+        return reward, breakdown
+
+    def _monotonicity_score(self, arrs):
+        # Accepts a list/array of 1D arrays (row and col), returns average normalized monotonicity
+        def mono_score(arr):
+            return sum(arr[i] >= arr[i+1] for i in range(len(arr)-1)) / (len(arr)-1)
+        if isinstance(arrs, np.ndarray) and arrs.ndim == 2:
+            scores = [mono_score(arr) for arr in arrs]
+            return np.mean(scores)
+        else:
+            return mono_score(arrs)
+
+    def get_reward_structure_str(self):
+        rw = self.reward_weights
+        return (
+            f"Reward: +{rw['max_in_corner']} if max in bottom-left, "
+            f"{rw['not_in_corner']} otherwise, "
+            f"{rw['moved_out_of_corner']} if moved out, "
+            f"+{rw['max_tile_increased']} max tile increased, "
+            f"+{self.monotonicity_weight}*monotonicity if max in bottom-left"
+        )
 
     def reset(self, seed=None, options=None):
         super().reset(seed=seed)
@@ -58,85 +133,124 @@ class Game2048Env(gym.Env):
         self.last_score = 0
         self.last_max_tile = np.max(self.game.board)
         obs = self._get_obs()
+        # --- Initialize episode metrics ---
+        self.episode_metrics = {
+            'step_count': 0,
+            'action_counts': np.zeros(4, dtype=int),
+            'max_tile_history': [],
+            'corner_occupancy': 0,
+            'monotonicity_history': [],
+            'empty_tiles_history': [],
+            'score_history': [],
+            'merge_events': 0,
+            'top_tile_merges': 0,
+            'reward_breakdown_history': [],
+            'final_score': 0,
+            'end_reason': None
+        }
         return obs, {}
 
+    def valid_moves(self):
+        # Returns a boolean mask of valid moves [up, down, left, right]
+        moves = ['up', 'down', 'left', 'right']
+        valid = []
+        for move in moves:
+            try:
+                test_game = Game2048()
+                test_game.board = self.game.board.copy()
+                test_game.score = self.game.score
+                test_game.move(move)
+                if not np.array_equal(test_game.board, self.game.board):
+                    valid.append(True)
+                else:
+                    valid.append(False)
+            except Exception:
+                valid.append(False)
+        return np.array(valid, dtype=bool)
+
     def step(self, action):
+        valid_mask = self.valid_moves()
+        if not valid_mask[action]:
+            # Explicit penalty and termination for invalid move
+            reward = -20.0  # Clearly negative penalty
+            done = True
+            obs = self._get_obs()
+            self.episode_metrics['final_score'] = int(self.game.score)
+            self.episode_metrics['end_reason'] = 'invalid_move'
+            info = {
+                'episode': {'r': reward, 'l': 1},
+                'max_tile': int(np.max(self.game.board)),
+                'end_reason': 'invalid_move',
+                'valid_moves': valid_mask,
+                'metrics': self.episode_metrics.copy()
+            }
+            return obs, reward, done, False, info
+
         move = ['up', 'down', 'left', 'right'][action]
         board_before = self.game.board.copy()
         score_before = self.game.score
         max_tile_before = np.max(board_before)
 
-        try:
-            self.game.move(move)
-        except Exception:
-            reward = -10.0
-            done = True
-            obs = self._get_obs()
-            info = {'episode': {'r': reward, 'l': 1}, 'max_tile': int(np.max(self.game.board))}
-            return obs, reward, done, False, info
+        before_flat = board_before.flatten()
+        self.game.move(move)
+        after_flat = self.game.board.flatten()
 
-        reward = self._compute_reward(board_before, score_before, max_tile_before)
-        done = self.game.is_game_over()
+        merges = np.sum((after_flat > before_flat) & (after_flat > 2))
+        self.episode_metrics['merge_events'] += merges
+
+        max_tile_after = np.max(self.game.board)
+        if max_tile_after > max_tile_before and np.count_nonzero(after_flat == max_tile_after) == 1:
+            self.episode_metrics['top_tile_merges'] += 1
+
+        reward, breakdown = self._compute_reward(board_before, score_before, max_tile_before)
+
+        self.episode_metrics['step_count'] += 1
+        self.episode_metrics['action_counts'][action] += 1
+        self.episode_metrics['max_tile_history'].append(int(max_tile_after))
+
+        bottom_left = (3, 0)
+        if self.game.board[bottom_left] == max_tile_after:
+            self.episode_metrics['corner_occupancy'] += 1
+
+        left_col = self.game.board[:, 0]
+        mono_score = sum(left_col[i] >= left_col[i+1] for i in range(3)) / 3.0
+        self.episode_metrics['monotonicity_history'].append(mono_score)
+
+        empty_tiles = np.count_nonzero(self.game.board == 0)
+        self.episode_metrics['empty_tiles_history'].append(empty_tiles)
+
+        self.episode_metrics['score_history'].append(int(self.game.score))
+        self.episode_metrics['reward_breakdown_history'].append(breakdown)
+
+        done = self.game.is_game_over() or (np.max(self.game.board) >= 2**20)
         obs = self._get_obs()
-        info = {'episode': {'r': reward, 'l': 1}, 'max_tile': int(np.max(self.game.board))}
+
+        end_reason = ('game_over' if self.game.is_game_over()
+                    else 'max_tile_limit' if np.max(self.game.board) >= 2**20
+                    else 'not_done')
+
+        if done:
+            self.episode_metrics['final_score'] = int(self.game.score)
+            self.episode_metrics['end_reason'] = end_reason
+
+        info = {
+            'episode': {'r': reward, 'l': 1},
+            'max_tile': int(np.max(self.game.board)),
+            'end_reason': end_reason,
+            'valid_moves': valid_mask,
+            'metrics': self.episode_metrics.copy() if done else None
+        }
         return obs, reward, done, False, info
 
-    def _compute_reward(self, board_before, score_before, max_tile_before):
-        score_after = self.game.score
-        board_after = self.game.board
-        max_tile_after = np.max(board_after)
-        reward = score_after - score_before
-        # Nonlinear merge bonus
-        if max_tile_after > max_tile_before:
-            reward += (max_tile_after ** self.merge_bonus_exp - max_tile_before ** self.merge_bonus_exp)
-        # Bonus for new max tiles
-        if max_tile_after >= 4096 and max_tile_before < 4096:
-            reward += self.milestone_4096
-        elif max_tile_after >= 2048 and max_tile_before < 2048:
-            reward += self.milestone_2048
-        elif max_tile_after >= 1024 and max_tile_before < 1024:
-            reward += self.milestone_1024
-        # Dynamic weights for empty tile and monotonicity rewards (can be swept or fixed)
-        empty_tile_weight = self.empty_tile_weight
-        monotonicity_weight = self.monotonicity_weight
-        empty_tiles = np.count_nonzero(board_after == 0)
-        reward += empty_tile_weight * empty_tiles
-        # Cornerness bonus: reward if max tile is in a corner
-        corners = [(0,0), (0,3), (3,0), (3,3)]
-        if any(board_after[c] == max_tile_after for c in corners):
-            reward += self.corner_bonus
-        # Monotonicity bonus: reward if rows/cols are monotonic from a corner
-        reward += monotonicity_weight * self._monotonicity_score(board_after)
-        # Penalty per move
-        reward -= self.move_penalty
-        # Penalty for losing
-        if self.game.is_game_over():
-            reward -= self.lose_penalty
-        return reward
-
-    def _monotonicity_score(self, board):
-        # Check monotonicity from each corner, take the best
-        def mono_score(arr):
-            return sum(arr[i] >= arr[i+1] for i in range(len(arr)-1))
-        best = 0
-        for row in [0, 3]:
-            for col in [0, 3]:
-                if row == 0:
-                    row_seq = board[row, :] if col == 0 else board[row, ::-1]
-                else:
-                    row_seq = board[row, :] if col == 0 else board[row, ::-1]
-                if col == 0:
-                    col_seq = board[:, col] if row == 0 else board[::-1, col]
-                else:
-                    col_seq = board[:, col] if row == 0 else board[::-1, col]
-                row_mono = mono_score(row_seq)
-                col_mono = mono_score(col_seq)
-                best = max(best, row_mono + col_mono)
-        # Normalize: max possible is 6+6=12
-        return best / 12.0
-
     def _get_obs(self):
-        return np.where(self.game.board > 0, np.log2(self.game.board), 0).flatten().astype(np.float32)
+        obs = np.where(self.game.board > 0, np.log2(self.game.board), 0).flatten().astype(np.float32)
+        # Add binary feature: 1 if max tile is in bottom-left, 0 otherwise
+        board = self.game.board
+        max_tile = np.max(board)
+        bottom_left = (3, 0)
+        max_in_corner = 1.0 if board[bottom_left] == max_tile else 0.0
+        obs = np.concatenate([obs, [max_in_corner]]).astype(np.float32)
+        return obs
 
     def render(self, mode="human"):
         print(self.game.board)

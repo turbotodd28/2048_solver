@@ -10,3 +10,30 @@ __pycache__/
 .idea/
 .vscode/
 *.egg-info/
+
+# Data, models, and sweep results
+*.zip
+reward_sweep_full_results.json
+reward_sweep_summary.csv
+reward_sweep_top_learning_curves.html
+/dqn_2048_model/
+
+# Installer logs
+pip-log.txt
+pip-delete-this-directory.txt
+
+# Unit test / coverage reports
+htmlcov/
+.tox/
+.nox/
+.coverage
+.coverage.*
+.cache
+nosetests.xml
+coverage.xml
+*.cover
+.hypothesis/
+.pytest_cache/
+
+# Jupyter Notebook checkpoints
+.ipynb_checkpoints
