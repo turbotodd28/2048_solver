@@ -7,6 +7,8 @@ import torch.optim as optim
 from collections import deque
 import warnings
 from src.game import Game2048
+import cProfile
+import pstats
 
 warnings.filterwarnings("ignore", category=RuntimeWarning)
 
@@ -15,10 +17,13 @@ class DQNNet(nn.Module):
     def __init__(self, input_dim, output_dim):
         super().__init__()
         self.fc = nn.Sequential(
-            nn.Linear(input_dim, 512), nn.ReLU(),
-            nn.Linear(512, 512), nn.ReLU(),
+            nn.Linear(input_dim, 2048), nn.ReLU(),
+            nn.Linear(2048, 1024), nn.ReLU(),
+            nn.Linear(1024, 1024), nn.ReLU(),
+            nn.Linear(1024, 512), nn.ReLU(),
             nn.Linear(512, 256), nn.ReLU(),
-            nn.Linear(256, output_dim)
+            nn.Linear(256, 128), nn.ReLU(),
+            nn.Linear(128, output_dim)
         )
 
     def forward(self, x):
@@ -26,12 +31,12 @@ class DQNNet(nn.Module):
 
 
 class DQNSolver2048:
-    def __init__(self, n_games=1000, gamma=0.99, lr=1e-3, batch_size=256, memory_size=100000, epsilon=1.0, epsilon_min=0.1, epsilon_decay=0.995, target_update=10):
+    def __init__(self, n_games=1000, gamma=0.99, lr=1e-3, batch_size=8192, memory_size=5e6, epsilon=1.0, epsilon_min=0.1, epsilon_decay=0.995, target_update=10):
         self.n_games = n_games
         self.gamma = gamma
         self.lr = lr
         self.batch_size = batch_size
-        self.memory = deque(maxlen=memory_size)
+        self.memory = deque(maxlen=int(memory_size))
         self.epsilon = epsilon
         self.epsilon_min = epsilon_min
         self.epsilon_decay = epsilon_decay
@@ -90,7 +95,7 @@ class DQNSolver2048:
         if np.random.rand() < self.epsilon:
             return random.choice(valid_moves)
         with torch.no_grad():
-            q_values = self.policy_net(state.unsqueeze(0)).cpu().numpy()[0]
+            q_values = self.policy_net(state.unsqueeze(0)).detach().cpu().numpy()[0]
         move_indices = [self.actions.index(m) for m in valid_moves]
         valid_qs = [q_values[i] for i in move_indices]
         return valid_moves[np.argmax(valid_qs)]
@@ -100,8 +105,8 @@ class DQNSolver2048:
             return
         batch = random.sample(self.memory, self.batch_size)
         states, actions, rewards, next_states, dones = zip(*batch)
-        states = torch.stack(states)
-        next_states = torch.stack(next_states)
+        states = torch.stack(states).to(self.device)
+        next_states = torch.stack(next_states).to(self.device)
         actions = torch.tensor([self.actions.index(a) for a in actions], device=self.device)
         rewards = torch.tensor(rewards, dtype=torch.float32, device=self.device)
         dones = torch.tensor(dones, dtype=torch.float32, device=self.device)
@@ -115,11 +120,14 @@ class DQNSolver2048:
         self.optimizer.step()
 
     def train(self):
+        import time
+        total_start = time.time()
+        game_times = []
         for game_idx in range(self.n_games):
+            game_start = time.time()
             game = Game2048()
             move_count = 0
             state = self.get_state(game.board)
-            prev_max_tile = np.max(game.board)
             while not game.is_game_over() and move_count < 1000:
                 valid_moves = self.get_valid_moves(game)
                 if not valid_moves:
@@ -145,15 +153,20 @@ class DQNSolver2048:
             self.scores.append(game.score)
             self.moves.append(move_count)
             self.max_tiles.append(np.max(game.board))
+            game_end = time.time()
+            game_times.append(game_end - game_start)
             if self.epsilon > self.epsilon_min:
                 self.epsilon = max(self.epsilon_min, self.epsilon * self.epsilon_decay)
             if (game_idx + 1) % 100 == 0:
-                print(f"Game {game_idx+1}/{self.n_games} | Avg score: {np.mean(self.scores[-100:]):.2f} | Epsilon: {self.epsilon:.3f}")
+                print(f"Game {game_idx+1}/{self.n_games} | Avg score: {np.mean(self.scores[-100:]):.2f} | Epsilon: {self.epsilon:.3f} | Avg game time: {np.mean(game_times[-100:]):.3f}s")
+        total_end = time.time()
         print(f"DQN agent played {self.n_games} games.")
         print(f"Average score: {np.mean(self.scores):.2f}")
         print(f"Average moves: {np.mean(self.moves):.2f}")
         print(f"Average highest tile: {np.mean(self.max_tiles):.2f}")
         print(f"Max tile achieved: {np.max(self.max_tiles)}")
+        print(f"Total training time: {total_end - total_start:.2f} seconds")
+        print(f"Average time per game: {np.mean(game_times):.3f} seconds")
 
     def plot_results(self):
         plt.figure(figsize=(15, 4))
@@ -188,5 +201,7 @@ class DQNSolver2048:
 
 if __name__ == "__main__":
     agent = DQNSolver2048(n_games=10000)
-    agent.train()
+    cProfile.run('agent.train()', 'profile_stats')
     agent.plot_results()
+    print("Profiling results saved to 'profile_stats'. To view, run:")
+    print("    python -m pstats profile_stats")

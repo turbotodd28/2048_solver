@@ -1,69 +1,75 @@
+#!/usr/bin/env python3
+"""
+Reward sweep without premature stopping - allows full training for all configurations
+"""
+
+import os
+import time
+import json
+import glob
 import itertools
 import numpy as np
-from src.sb3_train import PlottingCallback
-from src.gym_env import Game2048Env
-import csv
-import json
-import time
-import os
-import tempfile
-import shutil
-import glob
 from stable_baselines3 import DQN
+from .gym_env import Game2048Env
+from .sb3_train import PlottingCallback
 
-# --- Utility: JSON-safe saving ---
 def clean_for_json(obj):
+    """Convert numpy types to native Python types for JSON serialization"""
     if isinstance(obj, dict):
-        return {k: clean_for_json(v) for k, v in obj.items() if k not in ('env_ref', 'callback', 'model', 'env', 'eval_env')}
+        return {k: clean_for_json(v) for k, v in obj.items()}
     elif isinstance(obj, list):
         return [clean_for_json(v) for v in obj]
     elif isinstance(obj, np.ndarray):
         return obj.tolist()
-    elif hasattr(obj, 'tolist'):
-        return obj.tolist()
-    elif isinstance(obj, (int, float, str, bool)) or obj is None:
-        return obj
+    elif isinstance(obj, np.integer):
+        return int(obj)
+    elif isinstance(obj, np.floating):
+        return float(obj)
     else:
-        return str(obj)
+        return obj
 
 def atomic_save_json(obj, filename):
-    with tempfile.NamedTemporaryFile('w', delete=False, dir='.') as tf:
-        json.dump(obj, tf, indent=2)
-        tempname = tf.name
-    shutil.move(tempname, filename)
+    """Save JSON atomically to avoid corruption"""
+    temp_filename = filename + '.tmp'
+    with open(temp_filename, 'w') as f:
+        json.dump(obj, f, indent=2)
+    os.rename(temp_filename, filename)
 
-# --- Dashboard helpers ---
 def try_import_rich():
+    """Try to import rich for better console output"""
     try:
         from rich.console import Console
         from rich.table import Table
-        return Console, Table
+        return Console(), Table
     except ImportError:
-        import subprocess
-        import sys
-        subprocess.check_call([sys.executable, '-m', 'pip', 'install', 'rich'])
-        from rich.console import Console
-        from rich.table import Table
-        return Console, Table
-
-Console, Table = try_import_rich()
+        return None, None
 
 def print_sweep_status(results, sweep_ids, step_dict, reward_dict, best_so_far_dict, stopped_dict):
-    console = Console()
-    table = Table(show_header=True, header_style="bold magenta")
-    table.add_column("Sweep ID")
-    table.add_column("Steps", justify="right")
-    table.add_column("Mean Reward", justify="right")
-    table.add_column("Best So Far", justify="right")
-    table.add_column("Stopped", justify="center")
-    for sid in sweep_ids:
-        table.add_row(
-            sid,
-            str(step_dict.get(sid, "")),
-            f"{reward_dict.get(sid, 0):.2f}",
-            f"{best_so_far_dict.get(sid, 0):.2f}",
-            "✅" if stopped_dict.get(sid, False) else ""
-        )
+    """Print current status of all sweeps"""
+    console, Table = try_import_rich()
+    if console is None:
+        print("Install rich for better status display: pip install rich")
+        return
+    
+    table = Table(title="Reward Sweep Status")
+    table.add_column("Sweep", style="cyan")
+    table.add_column("Merge Power", style="magenta")
+    table.add_column("Steps", style="green")
+    table.add_column("Mean Reward", style="yellow")
+    table.add_column("Best So Far", style="blue")
+    table.add_column("Stopped", style="red")
+    
+    for sweep_id in sweep_ids:
+        params = results[sweep_id]['params']
+        merge_power = params.get('merge_power', 'N/A')
+        steps = step_dict.get(sweep_id, 0)
+        mean_reward = reward_dict.get(sweep_id, 0)
+        best_so_far = best_so_far_dict.get(sweep_id, 0)
+        stopped = "Yes" if stopped_dict.get(sweep_id, False) else "No"
+        
+        table.add_row(sweep_id, str(merge_power), str(steps), 
+                     f"{mean_reward:.1f}", f"{best_so_far:.1f}", stopped)
+    
     console.clear()
     console.print(table)
 
@@ -88,12 +94,12 @@ print(f"Running reward sweep with {total_sweeps} configurations.")
 
 results = {}
 
-# --- Sweep settings ---
+# --- Sweep settings (MODIFIED: No premature stopping) ---
 INIT_STEPS = 20_000
 CHUNK_STEPS = 20_000
 MIN_STEPS = 40_000
 MAX_STEPS = 250_000
-CUTOFF_FRAC = 0.5
+# CUTOFF_FRAC = 0.5  # REMOVED: No more premature stopping
 EVAL_EPISODES = 20
 
 # --- Reset flag ---
@@ -151,7 +157,7 @@ for i, values in enumerate(itertools.product(*param_values)):
     elapsed = time.time() - total_start_time
     print(f"[INIT] {sweep_id} complete. Elapsed time: {elapsed/60:.1f} min")
 
-# --- Adaptive extension loop ---
+# --- Adaptive extension loop (MODIFIED: No premature stopping) ---
 batting_order = sorted(results.keys(), key=lambda k: np.mean(results[k]['eval_rewards']), reverse=True)
 
 best_so_far = float('-inf')
@@ -172,6 +178,7 @@ for sweep_id in batting_order:
     total_steps = INIT_STEPS
     all_rewards, all_max_tiles = results[sweep_id]['eval_rewards'], results[sweep_id]['eval_max_tiles']
 
+    # MODIFIED: Train for full duration without premature stopping
     while total_steps < MAX_STEPS:
         model.learn(total_timesteps=CHUNK_STEPS, callback=callback, reset_num_timesteps=False)
         total_steps += CHUNK_STEPS
@@ -197,11 +204,13 @@ for sweep_id in batting_order:
         total_step_dict[sweep_id] = total_steps
         print_sweep_status(results, batting_order, total_step_dict, mean_reward_dict, best_so_far_dict, stopped_dict)
 
-        if total_steps >= MIN_STEPS and mean_reward < CUTOFF_FRAC * best_so_far:
-            print(f"{sweep_id}: Stopped early (mean_reward < {CUTOFF_FRAC*100:.0f}% of best)")
-            stopped_dict[sweep_id] = True
-            print_sweep_status(results, batting_order, total_step_dict, mean_reward_dict, best_so_far_dict, stopped_dict)
-            break
+        # REMOVED: No more premature stopping logic
+        # if total_steps >= MIN_STEPS and mean_reward < CUTOFF_FRAC * best_so_far:
+        #     print(f"{sweep_id}: Stopped early (mean_reward < {CUTOFF_FRAC*100:.0f}% of best)")
+        #     stopped_dict[sweep_id] = True
+        #     print_sweep_status(results, batting_order, total_step_dict, mean_reward_dict, best_so_far_dict, stopped_dict)
+        #     break
+        
         all_rewards.extend(eval_rewards)
         all_max_tiles.extend(eval_max_tiles)
 
@@ -216,4 +225,4 @@ for sweep_id in batting_order:
     print_sweep_status(results, batting_order, total_step_dict, mean_reward_dict, best_so_far_dict, stopped_dict)
 
 final_elapsed = time.time() - total_start_time
-print(f"\nTotal sweep time elapsed: {final_elapsed/60:.1f} min")
+print(f"\nTotal sweep time elapsed: {final_elapsed/60:.1f} min") 

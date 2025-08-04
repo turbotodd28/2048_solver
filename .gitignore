@@ -18,6 +18,18 @@ reward_sweep_summary.csv
 reward_sweep_top_learning_curves.html
 /dqn_2048_model/
 
+# Training artifacts
+tensorboard/
+checkpoints/
+*.zip
+sweep_*_init.zip
+dqn_*_sb3.zip
+
+# Analysis artifacts
+reward_sweep_analysis.png
+profile_stats
+*.html
+
 # Installer logs
 pip-log.txt
 pip-delete-this-directory.txt
