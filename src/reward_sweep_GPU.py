@@ -11,10 +11,21 @@ from src.gym_env import Game2048Env
 
 
 # === Config ===
-N_ENVS = 32
-TOTAL_STEPS = 100_000
-EVAL_EPISODES = 128
-DEBUG = False
+# Summary of reward sweep setup and evaluation (from notes):
+#
+# - We define a small set of hard-coded reward configurations (not a full grid sweep).
+# - For each configuration, we create N_ENVS (e.g., 32 or 128) parallel environments.
+# - For each configuration, its environments share a total pool of TOTAL_STEPS timesteps for training (e.g., 100,000 or 1,000,000).
+# - Each action in the environment is immediately assessed for reward using the current config's weights.
+# - After training, we evaluate the trained model by playing EVAL_EPISODES (e.g., 128) games per config.
+# - Each evaluation game runs until it ends or hits a move limit (e.g., 1000 moves).
+# - For each config, we record metrics like average reward, stddev, and possibly other stats (e.g., max tile, score).
+# - This allows us to compare how well each reward configuration enables the agent to learn to play 2048.
+
+N_ENVS = 128            # example: 128 parallel environments for each config
+TOTAL_STEPS = 1_000_000 # example: the 128 parallel environments will share this pool of 1,000,000 timesteps
+EVAL_EPISODES = 256     # example: 256 games for each config. this is the "final exam" after training
+DEBUG = True
 RESULTS_PATH = "reward_sweep_gpu_results.json"
 
 REWARD_VARIANTS = {
