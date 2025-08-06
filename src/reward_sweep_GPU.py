@@ -6,7 +6,7 @@ import numpy as np
 import multiprocessing as mp
 import argparse
 from stable_baselines3 import DQN
-from stable_baselines3.common.vec_env import DummyVecEnv
+from stable_baselines3.common.vec_env import SubprocVecEnv
 from src.gym_env import Game2048Env
 
 
@@ -22,8 +22,8 @@ from src.gym_env import Game2048Env
 # - For each config, we record metrics like average reward, stddev, and possibly other stats (e.g., max tile, score).
 # - This allows us to compare how well each reward configuration enables the agent to learn to play 2048.
 
-N_ENVS = 128            # example: 128 parallel environments for each config
-TOTAL_STEPS = 1_000_000 # example: the 128 parallel environments will share this pool of 1,000,000 timesteps
+N_ENVS = 64            # example: 64 parallel environments for each config
+TOTAL_STEPS = 1_000_000 # example: the 64 parallel environments will share this pool of 1,000,000 timesteps
 EVAL_EPISODES = 256     # example: 256 games for each config. this is the "final exam" after training
 DEBUG = True
 RESULTS_PATH = "reward_sweep_gpu_results.json"
@@ -89,7 +89,7 @@ def run_sweep_variant(sweep_id, reward_kwargs, force_fresh=False):
         print(f"[INFO] Skipping {sweep_id} (already completed)")
         return result_log[sweep_id]
 
-    vec_env = DummyVecEnv([make_env(reward_kwargs) for _ in range(N_ENVS)])
+    vec_env = SubprocVecEnv([make_env(reward_kwargs) for _ in range(N_ENVS)])
 
     model = DQN(
         "MlpPolicy",
