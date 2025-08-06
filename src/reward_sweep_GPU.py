@@ -1,5 +1,4 @@
 import os
-import time
 import torch
 import json
 import numpy as np
@@ -8,6 +7,7 @@ import argparse
 from stable_baselines3 import DQN
 from stable_baselines3.common.vec_env import SubprocVecEnv
 from src.gym_env import Game2048Env
+from src.timer_utils import Timer
 
 
 # === Config ===
@@ -34,6 +34,9 @@ REWARD_VARIANTS = {
     "corner_penalty": {"corner_penalty": True},
     "combo": {"tile_bonus": 1.5, "corner_penalty": True},
 }
+
+
+
 
 
 def atomic_save_json(obj, filename):
@@ -129,21 +132,20 @@ def main():
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
 
-    start_time = time.time()
-    all_results = {}
+    with Timer("Total runtime"):
+        all_results = {}
 
-    for sweep_id, reward_kwargs in REWARD_VARIANTS.items():
-        result = run_sweep_variant(
-            sweep_id,
-            reward_kwargs=reward_kwargs,
-            force_fresh=args.fresh
-        )
-        all_results[sweep_id] = result
+        for sweep_id, reward_kwargs in REWARD_VARIANTS.items():
+            result = run_sweep_variant(
+                sweep_id,
+                reward_kwargs=reward_kwargs,
+                force_fresh=args.fresh
+            )
+            all_results[sweep_id] = result
 
-    print("\n--- Sweep Summary ---")
-    for k, v in all_results.items():
-        print(f"{k}: {v['avg_reward']:.2f} ± {v['std_reward']:.2f}")
-    print(f"Total runtime: {time.time() - start_time:.1f}s")
+        print("\n--- Sweep Summary ---")
+        for k, v in all_results.items():
+            print(f"{k}: {v['avg_reward']:.2f} ± {v['std_reward']:.2f}")
 
 
 if __name__ == "__main__":
