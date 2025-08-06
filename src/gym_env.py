@@ -11,7 +11,8 @@ class Game2048Env(gym.Env):
         self.action_space = spaces.Discrete(4)
         self.observation_space = spaces.Box(low=0, high=1, shape=(17,), dtype=np.float32)
         self.game = Game2048()
-        self.invalid_move_count = 0
+        
+
 
         # Reward weights (milestones disabled for now)
         self.reward_weights = {
@@ -32,87 +33,82 @@ class Game2048Env(gym.Env):
 
     def get_reward_structure_str(self):
         return ", ".join(f"{k}={v}" for k, v in self.reward_weights.items())
+    
+
 
     def reset(self, seed=None, options=None):
         super().reset(seed=seed)
         self.game = Game2048()
-        self.invalid_move_count = 0
         return self._get_obs(), {}
 
     def step(self, action):
-        valid_mask = self.valid_moves()
-        if not valid_mask[action]:
-            reward = self.reward_weights['invalid_penalty']
-            self.invalid_move_count += 1
-            done = self.invalid_move_count >= 5
-            return self._get_obs(), reward, done, False, {}
-
         move = ['up', 'down', 'left', 'right'][action]
+        
+        # Capture state before move
         board_before = self.game.board.copy()
         score_before = self.game.score
         max_tile_before = np.max(board_before)
+        
+        # Try the move
+        try:
+            self.game.move(move)
+            board_after = self.game.board
+            score_after = self.game.score
+            max_tile_after = np.max(board_after)
+            
+            # Check if move was valid (board changed)
+            if np.array_equal(board_before, board_after):
+                # Invalid move - board didn't change
+                reward = self.reward_weights['invalid_penalty']
+                return self._get_obs(), reward, False, False, {}
+            
+            # Valid move - board changed
+            rw = self.reward_weights
 
-        self.game.move(move)
-        self.invalid_move_count = 0
+            reward = score_after - score_before
+            if max_tile_after > max_tile_before:
+                reward += (max_tile_after ** rw['merge_power'] - max_tile_before ** rw['merge_power'])
 
-        board_after = self.game.board
-        score_after = self.game.score
-        max_tile_after = np.max(board_after)
-        rw = self.reward_weights
+            # (Temporarily disabled) milestone bonuses
+            if max_tile_after >= 4096 and max_tile_before < 4096:
+                reward += rw['milestone_4096']
+            elif max_tile_after >= 2048 and max_tile_before < 2048:
+                reward += rw['milestone_2048']
+            elif max_tile_after >= 1024 and max_tile_before < 1024:
+                reward += rw['milestone_1024']
 
-        reward = score_after - score_before
-        if max_tile_after > max_tile_before:
-            reward += (max_tile_after ** rw['merge_power'] - max_tile_before ** rw['merge_power'])
+            reward += rw['empty_tile'] * np.count_nonzero(board_after == 0)
 
-        # (Temporarily disabled) milestone bonuses
-        if max_tile_after >= 4096 and max_tile_before < 4096:
-            reward += rw['milestone_4096']
-        elif max_tile_after >= 2048 and max_tile_before < 2048:
-            reward += rw['milestone_2048']
-        elif max_tile_after >= 1024 and max_tile_before < 1024:
-            reward += rw['milestone_1024']
+            # Corner penalty/bonus logic (only penalize if moved out)
+            was_in_corner = (max_tile_before > 0 and board_before[3, 0] == max_tile_before)
+            now_in_corner = (max_tile_after > 0 and board_after[3, 0] == max_tile_after)
+            if was_in_corner and not now_in_corner:
+                reward += rw['corner_penalty']
+            if now_in_corner:
+                reward += rw['corner_bonus']
 
-        reward += rw['empty_tile'] * np.count_nonzero(board_after == 0)
+            reward += rw['step_penalty']
 
-        # Corner penalty/bonus logic (only penalize if moved out)
-        was_in_corner = np.argmax(board_before) == 3 * 4 + 0
-        now_in_corner = np.argmax(board_after) == 3 * 4 + 0
-        if was_in_corner and not now_in_corner:
-            reward += rw['corner_penalty']
-        if now_in_corner:
-            reward += rw['corner_bonus']
+            done = self.game.is_game_over()
+            if done:
+                reward += rw['gameover_penalty']
 
-        reward += rw['step_penalty']
-
-        done = self.game.is_game_over()
-        if done:
-            reward += rw['gameover_penalty']
-
-        return self._get_obs(), reward, done, False, {
-            "score": self.game.score,
-            "max_tile": int(max_tile_after),
-            "board": self.game.board.copy()
-        }
-
-    def valid_moves(self):
-        moves = ['up', 'down', 'left', 'right']
-        valid = []
-        for move in moves:
-            try:
-                test_game = Game2048()
-                test_game.board = self.game.board.copy()
-                test_game.score = self.game.score
-                test_game.move(move)
-                valid.append(not np.array_equal(test_game.board, self.game.board))
-            except ValueError:
-                valid.append(False)
-        return np.array(valid, dtype=bool)
+            return self._get_obs(), reward, done, False, {
+                "score": self.game.score,
+                "max_tile": int(max_tile_after),
+                "board": self.game.board.copy()
+            }
+            
+        except ValueError:
+            # Invalid move - game threw exception
+            reward = self.reward_weights['invalid_penalty']
+            return self._get_obs(), reward, False, False, {}
 
     def _get_obs(self):
         with np.errstate(divide='ignore'):
             obs = np.where(self.game.board > 0, np.log2(self.game.board) / 11, 0).flatten().astype(np.float32)
         max_tile = np.max(self.game.board)
-        max_in_corner = 1.0 if self.game.board[3, 0] == max_tile else 0.0
+        max_in_corner = 1.0 if (max_tile > 0 and self.game.board[3, 0] == max_tile) else 0.0
         return np.concatenate([obs, [max_in_corner]]).astype(np.float32)
 
     def render(self, mode="human"):

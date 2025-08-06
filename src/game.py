@@ -42,19 +42,29 @@ class Game2048:
 
         original_board = self.board.copy()
         rotated = False
+        
+        # Strategy: Convert all moves to leftward operations by rotating/flipping the board
+        # This allows us to use a single slide_and_merge function for all directions
+        
+        # For up/down moves: transpose the board so columns become rows
         if direction in ['up', 'down']:
             self.board = self.board.T
             rotated = True
 
+        # For down/right moves: flip horizontally so we can slide leftward
+        # This converts right->left and down->up (after transpose)
         if direction in ['down', 'right']:
             self.board = np.flip(self.board, axis=1)
 
+        # Apply leftward slide and merge to all rows
         for i in range(4):
             self.board[i] = self.slide_and_merge(self.board[i])
 
+        # Reverse the horizontal flip if it was applied
         if direction in ['down', 'right']:
             self.board = np.flip(self.board, axis=1)
 
+        # Reverse the transpose if it was applied
         if rotated:
             self.board = self.board.T
 
@@ -68,11 +78,17 @@ class Game2048:
         # Check if any cell is empty
         if np.any(self.board == 0):
             return False
-        # Check if any move is possible
+        
+        # Check if any move is possible by looking for adjacent equal tiles
+        # Optimized: check each position only once for both horizontal and vertical matches
         for i in range(4):
             for j in range(4):
-                if (i < 3 and self.board[i, j] == self.board[i + 1, j]) or \
-                   (j < 3 and self.board[i, j] == self.board[i, j + 1]):
+                current = self.board[i, j]
+                # Check right neighbor (horizontal match)
+                if j < 3 and current == self.board[i, j + 1]:
+                    return False
+                # Check bottom neighbor (vertical match)
+                if i < 3 and current == self.board[i + 1, j]:
                     return False
         return True
 
