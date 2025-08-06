@@ -1,9 +1,5 @@
 numpy
-pygame
 torch
 stable-baselines3
 gymnasium
 matplotlib
-rich
-pytest
-psutil
