@@ -65,4 +65,16 @@ some metrics might be:
 - max tile achieved
 - total game score which is defined in game.py (note this is NOT the same as the reward tally)
 - monotonicity e.g. making the snake pattern where highest tile is in bottom left, above that is smaller etc then it "snakes" around where the next column decreases from top to bottom
-- 
+
+Improve parallelization ideas:
+- use SubprocVecEnv instead of DummyVecEnv #DONE
+- use batched inference or multi-threaded eval e.g. ThreadPoolExecutor
+
+Improve reward function evaluation
+- max tile per episode
+- cornerness (how well we're keeping max tile in corner)
+- game score (from game.py, separate from reward score)
+- other metrics (total merges, monotonicity)
+
+Store those metrics in a list and compute mean & stddev for each config
+Maybe save in json or CSV for plotting
