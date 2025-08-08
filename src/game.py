@@ -92,6 +92,60 @@ class Game2048:
                     return False
         return True
 
+    # === Action mask helpers (no side effects) ===
+    def _slide_and_merge_preview(self, row: np.ndarray) -> np.ndarray:
+        """Pure version of slide_and_merge that does not touch score.
+        Used only to check whether a move would change the board.
+        """
+        non_zero = row[row != 0]
+        new_row = []
+        skip = False
+        for i in range(len(non_zero)):
+            if skip:
+                skip = False
+                continue
+            if i < len(non_zero) - 1 and non_zero[i] == non_zero[i + 1]:
+                new_row.append(non_zero[i] * 2)
+                skip = True
+            else:
+                new_row.append(non_zero[i])
+        while len(new_row) < len(row):
+            new_row.append(0)
+        return np.array(new_row)
+
+    def _preview_board_after_move(self, direction: str) -> np.ndarray:
+        if direction not in ['up', 'down', 'left', 'right']:
+            raise ValueError("Invalid move direction")
+        preview = self.board.copy()
+
+        rotated = False
+        if direction in ['up', 'down']:
+            preview = preview.T
+            rotated = True
+        if direction in ['down', 'right']:
+            preview = np.flip(preview, axis=1)
+        for i in range(4):
+            preview[i] = self._slide_and_merge_preview(preview[i])
+        if direction in ['down', 'right']:
+            preview = np.flip(preview, axis=1)
+        if rotated:
+            preview = preview.T
+        return preview
+
+    def is_move_possible(self, direction: str) -> bool:
+        """Return True if applying direction would change the board."""
+        try:
+            preview = self._preview_board_after_move(direction)
+        except ValueError:
+            return False
+        return not np.array_equal(preview, self.board)
+
+    def get_valid_action_mask(self) -> np.ndarray:
+        """Boolean mask for actions [up, down, left, right]."""
+        directions = ['up', 'down', 'left', 'right']
+        mask = [self.is_move_possible(d) for d in directions]
+        return np.array(mask, dtype=bool)
+
     def render(self, stdscr, previous_board=None):
         stdscr.clear()
         stdscr.addstr(0, 0, f"Score: {self.score}    Moves: {self.move_count}\n")

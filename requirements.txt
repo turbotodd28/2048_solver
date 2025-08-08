@@ -3,3 +3,5 @@ torch
 stable-baselines3
 gymnasium
 matplotlib
+plotly
+sb3-contrib

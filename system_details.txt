@@ -1,0 +1,6 @@
+Memory: 64GB
+Processor: Intel® Core Ultra 7 265K × 20
+Graphics: NVIDIA GeForce RTX 5070 Ti
+OS: Ubuntu 24.04.2 LTS
+Windowing System: X11
+Kernel: 6.14.0-27-generic
