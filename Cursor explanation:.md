@@ -59,4 +59,11 @@ why do we choose 64 environments? how did we determine that that is the best num
 I think I really need an ELI5 primer on the rollout and optimization e.g. n-steps, batch size, epochs.
 Really you should assume I know next to nothing about machine learning. This is my first project.
 
-In reading the long list of flags, it seems to me that the original script wasn't achieving the goal of learning how to play 2048 so then we just added more features that have made the whole process a lot more complicated. Should we consider maybe taking a step back and stripping out a lot of these features to start from a simpler baseline?
+In reading the long list of flags, it seems to me that the original script wasn't achieving the goal of learning how to play 2048 so then we just added more features that have made the whole process a lot more complicated, instead of trying to refine a simpler version. By more complicated I mean this has a lot of moving parts - expert assist, shaping, curriculum etc and all of these could be helpful but don't they also open up opportunity for error? Should we consider maybe taking a step back and stripping out a lot of these features to start from a simpler baseline?
+
+===================================================
+
+I think we need to dive deeper into how a PPO update works. I understand that we are gathering data in chunks called the rollout_buffer and then chopping that up into pieces called batches to feed into the PPO (aka the optimizer), but that whole "feed stuff into PPO" is a black box to me. I don't understand why we cut the rollout buffer into pieces and then split it up further into epochs and pass it through more than once (what???) Is PPO the optimizer or is SGD the optimizer? I don't know these terms or how they're related. 
+
+
+
