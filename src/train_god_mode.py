@@ -12,6 +12,7 @@ from sb3_contrib import MaskablePPO
 from sb3_contrib.common.wrappers import ActionMasker
 from stable_baselines3.common.vec_env import DummyVecEnv, SubprocVecEnv, VecNormalize
 from stable_baselines3.common.callbacks import BaseCallback
+from src.expectimax import expectimax_best_action
 
 # Robust imports: allow running as module or script
 try:
@@ -41,10 +42,21 @@ class GodMode2048Env(gym.Env):
         super().__init__()
         self.game = Game2048()
         self.action_space = gym.spaces.Discrete(4)
-        self.observation_space = gym.spaces.Box(low=0.0, high=1.0, shape=(16,), dtype=np.float32)
+        # 16 board cells + 1 goal-conditioning scalar
+        self.observation_space = gym.spaces.Box(low=0.0, high=1.0, shape=(17,), dtype=np.float32)
         # Curriculum controls
         self._target_tile: int | None = None
         self._terminal_bonus: float = 0.0
+        # Mixed curriculum config
+        self._curr_current: int | None = None
+        self._curr_next: int | None = None
+        self._curr_mix_next_prob: float = 0.0
+        self._goal_conditioning: bool = True
+        # Potential-based shaping config
+        self._shaping_enabled: bool = False
+        self._shape_k_empty: float = 0.0
+        self._shape_k_second: float = 0.0
+        self._shape_gamma: float = 0.99
 
     def reset(self, seed: int | None = None, options: Dict[str, Any] | None = None):
         super().reset(seed=seed)
@@ -57,6 +69,7 @@ class GodMode2048Env(gym.Env):
         board_before = self.game.board.copy()
         max_tile_before = int(np.max(board_before))
         log_before = math.log2(max_tile_before) if max_tile_before > 0 else 0.0
+        phi_before = self._compute_potential(board_before) if self._shaping_enabled else 0.0
 
         try:
             self.game.move(move)
@@ -72,6 +85,9 @@ class GodMode2048Env(gym.Env):
         max_tile_after = int(np.max(self.game.board))
         log_after = math.log2(max_tile_after) if max_tile_after > 0 else 0.0
         reward = float(log_after - log_before)
+        if self._shaping_enabled:
+            phi_after = self._compute_potential(self.game.board)
+            reward += float(self._shape_gamma * phi_after - phi_before)
 
         done = self.is_game_over()
         reached_target = False
@@ -84,13 +100,19 @@ class GodMode2048Env(gym.Env):
             "max_tile": max_tile_after,
             "action_mask": self.get_action_mask(),
             "reached_target": reached_target,
+            "target_tile": int(self._target_tile) if self._target_tile is not None else 0,
         }
         return self._get_obs(), reward, done, False, info
 
     def _get_obs(self) -> np.ndarray:
         with np.errstate(divide='ignore'):
-            obs = np.where(self.game.board > 0, np.log2(self.game.board) / 11, 0).astype(np.float32)
-        return obs.flatten()
+            obs = np.where(self.game.board > 0, np.log2(self.game.board) / 11, 0).astype(np.float32).flatten()
+        # Append goal-conditioning scalar: normalized log2(target) if enabled
+        if self._goal_conditioning and self._target_tile is not None and self._target_tile > 0:
+            tgt = min(14, int(np.log2(self._target_tile))) / 11.0
+        else:
+            tgt = 0.0
+        return np.concatenate([obs, np.array([tgt], dtype=np.float32)], axis=0)
 
     def get_action_mask(self) -> np.ndarray:
         mask_bool = self.game.get_valid_action_mask()
@@ -112,6 +134,46 @@ class GodMode2048Env(gym.Env):
     def set_terminal_bonus(self, bonus: float):
         self._terminal_bonus = float(bonus)
 
+    # Mixed curriculum config: choose per-episode target on reset
+    def set_curriculum_config(self, current: int | None, next_target: int | None, mix_next_prob: float, terminal_bonus: float | None = None):
+        self._curr_current = int(current) if current is not None else None
+        self._curr_next = int(next_target) if next_target is not None else None
+        self._curr_mix_next_prob = float(np.clip(mix_next_prob, 0.0, 1.0))
+        if terminal_bonus is not None:
+            self._terminal_bonus = float(terminal_bonus)
+
+    def enable_goal_conditioning(self, enabled: bool):
+        self._goal_conditioning = bool(enabled)
+
+    # Shaping controls
+    def set_shaping_config(self, enabled: bool, k_empty: float, k_second: float, gamma: float):
+        self._shaping_enabled = bool(enabled)
+        self._shape_k_empty = float(k_empty)
+        self._shape_k_second = float(k_second)
+        self._shape_gamma = float(gamma)
+
+    def _compute_potential(self, board: np.ndarray) -> float:
+        # Empty tiles normalized
+        empty = float(np.count_nonzero(board == 0)) / 16.0
+        # Second-largest tile log2 normalized
+        flat = board.flatten()
+        # Handle case with all zeros
+        if flat.size == 0:
+            second_norm = 0.0
+        else:
+            # Get top two values
+            vals = np.sort(flat)
+            maxv = vals[-1] if vals.size > 0 else 0
+            # second largest: walk backward to find first value < maxv
+            second = 0
+            for v in vals[::-1]:
+                if v < maxv:
+                    second = int(v)
+                    break
+            second_log = math.log2(second) if second > 0 else 0.0
+            second_norm = min(14.0, second_log) / 11.0
+        return self._shape_k_empty * empty + self._shape_k_second * second_norm
+
 
 def mask_fn(env: GodMode2048Env):
     base = getattr(env, 'unwrapped', env)
@@ -128,8 +190,33 @@ def make_env(max_episode_steps: int):
         env = GodMode2048Env()
         env = gym.wrappers.TimeLimit(env, max_episode_steps=max_episode_steps)
         env = ActionMasker(env, mask_fn)
+        # Apply shaping config and curriculum defaults from outer scope via closures is tricky here.
+        # We will rely on env_method in callback _on_training_start to set shaping once vec_env is built.
         return env
     return _init
+
+
+class ExpertAssistWrapper(gym.Wrapper):
+    """With probability p, replace the agent's action by an expectimax action (lookahead).
+    This can improve exploration and expose the agent to stronger trajectories (DAGGER-like).
+    """
+    def __init__(self, env: gym.Env, assist_prob: float = 0.05, depth: int = 2, chance_sample_k: int = 6):
+        super().__init__(env)
+        self.assist_prob = float(assist_prob)
+        self.depth = int(depth)
+        self.chance_sample_k = int(chance_sample_k)
+
+    def step(self, action):
+        # Decide whether to override with expert
+        if np.random.rand() < self.assist_prob:
+            try:
+                base = getattr(self.env, 'unwrapped', self.env)
+                board = base.game.board  # type: ignore[attr-defined]
+                expert_a = expectimax_best_action(board, depth=self.depth, chance_sample_k=self.chance_sample_k)
+                action = int(expert_a)
+            except Exception:
+                pass
+        return self.env.step(action)
 
 
 class GodModeCallback(BaseCallback):
@@ -147,6 +234,7 @@ class GodModeCallback(BaseCallback):
         # Additional curves
         self.positive_reward_rate: list[float] = []
         self.avg_valid_actions: list[float] = []
+        self.final_max_tile_mean: list[float] = []
         # Curriculum
         self.enable_curriculum = curriculum
         self.curr_target = target_start if curriculum else None
@@ -170,6 +258,21 @@ class GodModeCallback(BaseCallback):
             try:
                 self.training_env.env_method('set_target_tile', self.curr_target)
                 self.training_env.env_method('set_terminal_bonus', float(self.curr_terminal_bonus))
+                # Also set mixed curriculum: blend current with next target at small probability
+                next_target = None
+                for t in [256, 512, 1024, 2048, 4096, 8192, 16384]:
+                    if t > int(self.curr_target):
+                        next_target = t
+                        break
+                self.training_env.env_method('set_curriculum_config', self.curr_target, next_target, 0.3, float(self.curr_terminal_bonus))
+                self.training_env.env_method('enable_goal_conditioning', True)
+                # Apply shaping if the main args requested it
+                try:
+                    args = self.locals.get('args', None)
+                except Exception:
+                    args = None
+                if args is not None and getattr(args, 'shaping', False):
+                    self.training_env.env_method('set_shaping_config', True, float(getattr(args, 'shape_k_empty', 0.02)), float(getattr(args, 'shape_k_second', 0.02)), float(getattr(args, 'shape_gamma', 0.99)))
                 print(f"[GodMode] Curriculum target initialized at {self.curr_target}", flush=True)
             except Exception:
                 pass
@@ -179,11 +282,14 @@ class GodModeCallback(BaseCallback):
         self._max_tile_sum = 0.0
         self._positive_reward_steps = 0
         self._valid_actions_sum = 0.0
+        self._final_tile_sum_window = 0.0
+        self._final_tile_count_window = 0
 
     def _on_step(self) -> bool:
         infos = self.locals.get("infos")
+        dones = self.locals.get("dones")
         if infos is not None:
-            for info in infos:
+            for idx, info in enumerate(infos):
                 if isinstance(info, dict) and "max_tile" in info:
                     self._max_tile_sum += float(info["max_tile"])
                     self._steps += 1
@@ -194,6 +300,14 @@ class GodModeCallback(BaseCallback):
                             self._valid_actions_sum += float(np.sum(mask))
                         except Exception:
                             pass
+                # Track end-of-episode final max tile accurately using dones from VecEnv
+                try:
+                    if isinstance(dones, (list, tuple, np.ndarray)) and idx < len(dones) and bool(dones[idx]):
+                        final_tile = int(info.get("max_tile", 0)) if isinstance(info, dict) else 0
+                        self._final_tile_sum_window += float(final_tile)
+                        self._final_tile_count_window += 1
+                except Exception:
+                    pass
                 # Curriculum episode accounting: look for episode termination flags
                 if isinstance(info, dict) and (info.get('terminal_observation') is not None or info.get('TimeLimit.truncated') is not None or info.get('reached_target') is not None):
                     # We don't have a reliable per-env done signal here; approximate using info keys
@@ -214,15 +328,18 @@ class GodModeCallback(BaseCallback):
             avg_tile = self._max_tile_sum / max(1, self._steps)
             pos_rate = float(self._positive_reward_steps) / max(1, self._steps)
             avg_valid_actions = self._valid_actions_sum / max(1, self._steps)
+            final_mean = (self._final_tile_sum_window / max(1, self._final_tile_count_window)) if self._final_tile_count_window > 0 else 0.0
             self.timesteps.append(self.num_timesteps)
             self.avg_max_tile.append(avg_tile)
             self.positive_reward_rate.append(pos_rate)
             self.avg_valid_actions.append(avg_valid_actions)
+            self.final_max_tile_mean.append(final_mean)
             # Log to TensorBoard if available
             try:
                 self.logger.record("custom/avg_max_tile_window", avg_tile)
                 self.logger.record("custom/positive_reward_rate", pos_rate)
                 self.logger.record("custom/avg_valid_actions", avg_valid_actions)
+                self.logger.record("custom/final_max_tile_mean", final_mean)
             except Exception:
                 pass
             self._reset()
@@ -241,6 +358,10 @@ class GodModeCallback(BaseCallback):
                         self.curr_target = next_targets[idx + 1]
                         if self.training_env is not None:
                             self.training_env.env_method('set_target_tile', self.curr_target)
+                            # Update mix: when we promote, still mix in the next, but reduce mix prob slightly
+                            next_target = next_targets[idx + 2] if (idx + 2) < len(next_targets) else None
+                            mix_prob = 0.2
+                            self.training_env.env_method('set_curriculum_config', self.curr_target, next_target, mix_prob, float(self.curr_terminal_bonus))
                             print(f"[GodMode] Curriculum promoted to {self.curr_target}", flush=True)
                 except ValueError:
                     pass
@@ -349,9 +470,60 @@ def evaluate(model: MaskablePPO, episodes: int = 256, obs_rms=None, max_episode_
     return results
 
 
+def evaluate_random_baseline(episodes: int = 256, max_episode_steps: int = 1000) -> Dict[str, Any]:
+    thresholds = [256, 512, 1024, 2048, 4096, 8192]
+    results = {
+        "max_tiles": [],
+        "moves": [],
+        "success_rates": {str(t): 0 for t in thresholds},
+    }
+    for _ in range(episodes):
+        env = GodMode2048Env()
+        env = gym.wrappers.TimeLimit(env, max_episode_steps=max_episode_steps)
+        # No ActionMasker; we will sample from the mask manually
+        obs, _ = env.reset()
+        done = False
+        truncated = False
+        max_tile = 0
+        steps = 0
+        while not (done or truncated):
+            mask = mask_fn(env)
+            valid_actions = np.flatnonzero(mask > 0.5)
+            if len(valid_actions) == 0:
+                # fallback: random from 0..3
+                action_idx = int(np.random.randint(0, 4))
+            else:
+                action_idx = int(np.random.choice(valid_actions))
+            obs, reward, done, truncated, info = env.step(action_idx)
+            max_tile = max(max_tile, info.get("max_tile", 0))
+            steps += 1
+        results["max_tiles"].append(max_tile)
+        results["moves"].append(steps)
+        for t in thresholds:
+            if max_tile >= t:
+                results["success_rates"][str(t)] += 1
+        try:
+            env.close()
+        except Exception:
+            pass
+    for k in list(results["success_rates"].keys()):
+        results["success_rates"][k] /= float(episodes)
+    return results
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--fresh", action="store_true", help="Ignore previous results and overwrite")
+    parser.add_argument(
+        "--run-name",
+        type=str,
+        default=None,
+        help=(
+            "Single name to derive --tb, --results, and --save. "
+            "Sets tb=runs/<name>, results=god_mode_results_<name>.json, "
+            "save=runs/<name>/final_model."
+        ),
+    )
     parser.add_argument("--num-envs", type=int, default=max(16, (os.cpu_count() or 20)), help="Number of parallel envs")
     parser.add_argument("--subproc", action="store_true", help="Use SubprocVecEnv for multi-core stepping")
     parser.add_argument("--total-steps", type=int, default=2_000_000, help="Total timesteps")
@@ -372,13 +544,37 @@ def main():
     parser.add_argument("--gamma", type=float, default=0.99, help="Discount factor")
     parser.add_argument("--vecnorm", action="store_true", help="Enable VecNormalize for observations")
     parser.add_argument("--episode-steps", type=int, default=2000, help="Max steps per episode")
+    parser.add_argument("--save", type=str, default=None, help="Prefix to save model (.zip) and VecNormalize stats (_vecnorm.pkl)")
     # Curriculum flags
     parser.add_argument("--curriculum", action="store_true", help="Enable curriculum on target tile")
     parser.add_argument("--curr-target-start", type=int, default=256, help="Initial curriculum target tile")
     parser.add_argument("--curr-promote", type=float, default=0.6, help="Promotion success rate threshold")
     parser.add_argument("--curr-window", type=int, default=512, help="Episodes per curriculum window")
     parser.add_argument("--curr-bonus", type=float, default=1.0, help="Terminal bonus when reaching target")
+    # Shaping flags (potential-based, policy-invariant)
+    parser.add_argument("--shaping", action="store_true", help="Enable potential-based shaping")
+    parser.add_argument("--shape-k-empty", type=float, default=0.02, help="Weight for empty tiles potential")
+    parser.add_argument("--shape-k-second", type=float, default=0.02, help="Weight for second-largest tile potential")
+    parser.add_argument("--shape-gamma", type=float, default=0.99, help="Discount for shaping potential term")
+    # Expert assist flags
+    parser.add_argument("--expert-assist", action="store_true", help="Enable expectimax-assisted actions during training")
+    parser.add_argument("--expert-prob", type=float, default=0.05, help="Probability to override action with expert each step")
+    parser.add_argument("--expert-depth", type=int, default=2, help="Expectimax depth")
+    parser.add_argument("--expert-k", type=int, default=6, help="Chance nodes sampled per level")
     args = parser.parse_args()
+
+    # Derive common paths from --run-name to avoid repeating names in flags
+    if getattr(args, "run_name", None):
+        run_base = args.run_name.strip()
+        # TensorBoard log directory
+        args.tb = f"runs/{run_base}"
+        # Results JSON: if the provided name already looks like a json filename, use as-is
+        if run_base.endswith(".json"):
+            args.results = run_base
+        else:
+            args.results = f"god_mode_results_{run_base}.json"
+        # Model save prefix (without extension)
+        args.save = f"runs/{run_base}/final_model"
 
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
@@ -389,10 +585,32 @@ def main():
 
     def make_vec_env(num_envs: int):
         if args.subproc:
-            return SubprocVecEnv([make_env(args.episode_steps) for _ in range(num_envs)], start_method="spawn")
-        return DummyVecEnv([make_env(args.episode_steps) for _ in range(num_envs)])
+            envs = [make_env(args.episode_steps) for _ in range(num_envs)]
+            venv = SubprocVecEnv(envs, start_method="spawn")
+        else:
+            venv = DummyVecEnv([make_env(args.episode_steps) for _ in range(num_envs)])
+        # Wrap with expert assistance if requested
+        if args.expert_assist:
+            try:
+                venv = venv.env_method  # type: ignore[attr-defined]
+            except Exception:
+                pass
+        return DummyVecEnv([
+            (lambda e=make_env(args.episode_steps): (
+                ExpertAssistWrapper(e(), assist_prob=args.expert_prob, depth=args.expert_depth, chance_sample_k=args.expert_k)
+            ) if args.expert_assist else e()) for _ in range(num_envs)
+        ]) if not args.subproc else SubprocVecEnv([
+            (lambda: ExpertAssistWrapper(make_env(args.episode_steps)(), assist_prob=args.expert_prob, depth=args.expert_depth, chance_sample_k=args.expert_k)
+            ) if args.expert_assist else make_env(args.episode_steps) for _ in range(num_envs)
+        ], start_method="spawn")
 
     vec_env = make_vec_env(args.num_envs)
+    # Optionally normalize observations for more stable learning
+    if args.vecnorm:
+        try:
+            vec_env = VecNormalize(vec_env, norm_obs=True, norm_reward=False, training=True)
+        except Exception:
+            pass
     if args.seed is not None:
         try:
             vec_env.seed(args.seed)
@@ -400,6 +618,8 @@ def main():
             pass
     arch = tuple(int(x) for x in args.arch.split(",") if x.strip())
 
+    # Store args in locals for callback access (to apply shaping via env_method)
+    locals_for_cb = {'args': args}
     model = MaskablePPO(
         "MlpPolicy",
         vec_env,
@@ -429,22 +649,35 @@ def main():
         entropy_start=args.entropy_start,
         entropy_end=args.entropy_end,
     )
+    # Inject args for callback to pick up shaping flags
+    try:
+        callback.locals.update(locals_for_cb)
+    except Exception:
+        pass
     model.learn(total_timesteps=args.total_steps, callback=callback)
 
     obs_rms = vec_env.obs_rms if isinstance(vec_env, VecNormalize) else None
     metrics = evaluate(model, episodes=args.eval_episodes, obs_rms=obs_rms, max_episode_steps=args.episode_steps)
+    baseline = evaluate_random_baseline(episodes=min(256, args.eval_episodes), max_episode_steps=args.episode_steps)
     summary = {
         "avg_max_tile": float(np.mean(metrics["max_tiles"])),
         "p95_max_tile": float(np.percentile(metrics["max_tiles"], 95)),
         "avg_moves": float(np.mean(metrics["moves"])),
         "success_rates": metrics["success_rates"],
+        "random_baseline": {
+            "avg_max_tile": float(np.mean(baseline["max_tiles"])),
+            "p95_max_tile": float(np.percentile(baseline["max_tiles"], 95)),
+            "success_rates": baseline["success_rates"],
+        },
         "train_curve": {
             "timesteps": callback.timesteps,
             "avg_max_tile": callback.avg_max_tile,
             "positive_reward_rate": callback.positive_reward_rate,
             "avg_valid_actions": callback.avg_valid_actions,
+            "final_max_tile_mean": callback.final_max_tile_mean,
         },
         "config": {
+            "run_name": args.run_name,
             "num_envs": args.num_envs,
             "subproc": args.subproc,
             "total_steps": args.total_steps,
@@ -475,6 +708,25 @@ def main():
     with open(tmp, "w") as f:
         json.dump(summary, f, indent=2)
     os.replace(tmp, args.results)
+
+    # Optional: save final model and VecNormalize stats
+    if getattr(args, "save", None):
+        save_prefix = args.save
+        try:
+            save_dir = os.path.dirname(save_prefix)
+            if save_dir:
+                os.makedirs(save_dir, exist_ok=True)
+        except Exception:
+            pass
+        try:
+            model.save(save_prefix + ".zip")
+        except Exception:
+            pass
+        try:
+            if isinstance(vec_env, VecNormalize):
+                vec_env.save(save_prefix + "_vecnorm.pkl")
+        except Exception:
+            pass
 
     print(
         f"[GodMode] avg max tile: {summary['avg_max_tile']:.1f} | p95: {summary['p95_max_tile']:.1f} | "

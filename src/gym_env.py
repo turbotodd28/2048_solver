@@ -11,6 +11,13 @@ class Game2048Env(gym.Env):
         self.action_space = spaces.Discrete(4)
         self.observation_space = spaces.Box(low=0, high=1, shape=(17,), dtype=np.float32)
         self.game = Game2048()
+        # Precompute a lookup table for normalized log2 to speed up observation encoding
+        # Map tile values 0..2^16 to log2(value)/11 (0 for zero)
+        max_tile_power = 16
+        lut_size = (1 << max_tile_power) + 1
+        self._obs_lut = np.zeros(lut_size + 1, dtype=np.float32)
+        for p in range(1, max_tile_power + 1):
+            self._obs_lut[1 << p] = p / 11.0
         
         # Episode-level counters for diagnostics/analytics
         self.episode_moves = 0
@@ -149,8 +156,14 @@ class Game2048Env(gym.Env):
             }
 
     def _get_obs(self):
-        with np.errstate(divide='ignore'):
-            obs = np.where(self.game.board > 0, np.log2(self.game.board) / 11, 0).flatten().astype(np.float32)
+        # Use LUT; guard values beyond LUT by falling back to log2 if encountered
+        board_vals = self.game.board
+        try:
+            obs_main = self._obs_lut[board_vals]
+        except Exception:
+            with np.errstate(divide='ignore'):
+                obs_main = np.where(board_vals > 0, np.log2(board_vals) / 11, 0).astype(np.float32)
+        obs = obs_main.flatten().astype(np.float32)
         max_tile = np.max(self.game.board)
         max_in_corner = 1.0 if (max_tile > 0 and self.game.board[3, 0] == max_tile) else 0.0
         return np.concatenate([obs, [max_in_corner]]).astype(np.float32)

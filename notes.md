@@ -60,6 +60,8 @@ follow-up thought/question - My PC is new and beastly (20 cores, 16gb VRAM). Whe
 
 NEXT STEPS
 
+- play a game counting moves, I think 1000 move max might be too low. Get a feel for how many moves are required to hit 256, 512, 1024 (extrapolate from there)
+
 for the evaluation phase, create a neutral "exam" so that reward weights don't bias the measurement of efficacy.
 some metrics might be:
 - max tile achieved
@@ -78,3 +80,55 @@ Improve reward function evaluation
 
 Store those metrics in a list and compute mean & stddev for each config
 Maybe save in json or CSV for plotting
+
+
+=========================
+Me trying to understand parameters and how this all works:
+
+we are basically training two separate but related things: policy update and critic update.
+policy is WHAT we do - given a board, this is the up/down/left/right decision
+critic is how a given board is evaluated - for any given board position, we try to estimate the resultant "goodness" of the board after we make a given move. e.g. if we have a given board and move LEFT, what is the single-number "value" of that move? The better the critic model, the closer our prediction matches the result 
+
+Our parameters and my understanding:
+-subproc # parallelization method - subproc=actual, vs dummy
+--num-envs 64 # how many environments we're running in parallel. this is so we aren't doing all runs sequentially.
+--total-steps 180000000 # total runtime across all environments. this would be like the total number of up/down/left/right across the entire run
+--n-steps 4096 # ?
+--batch-size 131072 # ? something to do with how we divide epochs. not sure what an epoch is in our context  
+--arch 1024,1024 # no idea 
+--lr 5e-5 # learning rate. weight for how strongly we update our learning based on our findings. Learning includes policy update and critic update. I think this weight applies to both?
+--n-epochs 20 # relates to batch size... although I thought total-steps = n_epochs*batch-size. but that math doesn't add up and also it would be overdefined since we have three variables and are defining all three.
+--entropy-start 0.03 
+--entropy-end 0.01 
+--clip-range 0.1 
+--gamma 0.995 
+--vecnorm 
+--episode-steps 3000 
+--curriculum # curriculum enable
+--curr-target-start 128
+--curr-promote 0.45 
+--curr-window 192 
+--curr-bonus 2.5 
+--expert-assist # expert assist enable
+--expert-prob 0.01 
+--expert-depth 1 
+--expert-k 3 
+--tb runs/god_mode_confirm_s2_180M_true_s2 
+--seed 2 # seed used for "random" number generation. I THINK this means that if you start a new game and make the same moves, your games will be deterministic e.g. have the same result.
+--eval-episodes 512 # test at the end? I didn't think we were doing this anymore
+--results god_mode_results_confirm_s2_180M_true_s2.json 
+--save runs/god_mode_confirm_s2_180M_true_s2/final_model
+
+
+
+
+1. regarding naming, looks like we're using "s2" to refer to both the series and the seed.
+e.g. in these filenames:
+god_mode_confirm_s2_180M_true_s2/PPO_1 
+ god_mode_confirm_s2_180M_true_s3/PPO_1 
+
+from now on let's explicitly write "seed2" or "seed3" so we don't get it mixed up with the series. Or let's just omit the "series" altogether, or if we want to keep the series maybe give it a "version" like v1 v2 etc
+
+2. so sometimes we will use an expert mvoe (at random, as determined by expert-prob e.g. .01 will make 1% of moves be an expert move). 
+3. I'm skeptical of the heuristic evaluator; I don't recall seeing this tested thoroughly. Does this update as the model trains? I'd like to see examples of this in action. Perhaps you can give a few board examples and show me how they would be evaluated for an expert move.
+4. 
