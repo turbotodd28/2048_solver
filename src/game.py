@@ -1,150 +1,164 @@
 import random
 import numpy as np
 import curses
+from typing import List, Optional, Tuple
 
 class Game2048:
-    def __init__(self):
-        self.board = np.zeros((4, 4), dtype=int)
+    """
+    Clean, fast 2048 game implementation focused on core mechanics.
+    No animation logic - designed for AI training and headless operation.
+    """
+    
+    def __init__(self, size: int = 4):
+        self.n = size
+        self.board = np.zeros((self.n, self.n), dtype=int)
         self.score = 0
         self.move_count = 0
-        self.add_random_tile()
-        self.add_random_tile()
+        # Start with two tiles as usual
+        self._add_random_tile()
+        self._add_random_tile()
 
-    def add_random_tile(self):
-        empty_cells = [(i, j) for i in range(4) for j in range(4) if self.board[i, j] == 0]
-        if empty_cells:
-            i, j = random.choice(empty_cells)
-            self.board[i, j] = 2 if random.random() < 0.9 else 4
+    def _add_random_tile(self) -> Optional[Tuple[int, int, int]]:
+        """Add a random tile and return (row, col, value) or None if no space."""
+        empty = [(i, j) for i in range(self.n) for j in range(self.n) if self.board[i, j] == 0]
+        if not empty:
+            return None
+        i, j = random.choice(empty)
+        val = 2 if random.random() < 0.9 else 4
+        self.board[i, j] = val
+        return (i, j, val)
 
-    def slide_and_merge(self, row):
-        # Slide non-zero elements to the left
-        non_zero = row[row != 0]
-        new_row = []
-        skip = False
-        for i in range(len(non_zero)):
-            if skip:
-                skip = False
-                continue
-            if i < len(non_zero) - 1 and non_zero[i] == non_zero[i + 1]:
-                new_row.append(non_zero[i] * 2)
-                self.score += non_zero[i] * 2
-                skip = True
-            else:
-                new_row.append(non_zero[i])
-        # Fill the rest with zeros to ensure proper clearing
-        while len(new_row) < len(row):
-            new_row.append(0)
-        return np.array(new_row)
-
-    def move(self, direction):
-        if direction not in ['up', 'down', 'left', 'right']:
-            raise ValueError("Invalid move direction")
-
-        original_board = self.board.copy()
+    def _transform(self, arr: np.ndarray, direction: str) -> Tuple[np.ndarray, bool]:
+        """Return a transformed view for computing 'left' logic."""
         rotated = False
-        
-        # Strategy: Convert all moves to leftward operations by rotating/flipping the board
-        # This allows us to use a single slide_and_merge function for all directions
-        
-        # For up/down moves: transpose the board so columns become rows
+        out = arr
         if direction in ['up', 'down']:
-            self.board = self.board.T
+            out = out.T
             rotated = True
-
-        # For down/right moves: flip horizontally so we can slide leftward
-        # This converts right->left and down->up (after transpose)
         if direction in ['down', 'right']:
-            self.board = np.flip(self.board, axis=1)
+            out = np.flip(out, axis=1)
+        return out, rotated
 
-        # Apply leftward slide and merge to all rows
-        for i in range(4):
-            self.board[i] = self.slide_and_merge(self.board[i])
-
-        # Reverse the horizontal flip if it was applied
+    def _inverse_transform(self, arr: np.ndarray, direction: str, rotated: bool) -> np.ndarray:
+        out = arr
         if direction in ['down', 'right']:
-            self.board = np.flip(self.board, axis=1)
-
-        # Reverse the transpose if it was applied
+            out = np.flip(out, axis=1)
         if rotated:
-            self.board = self.board.T
+            out = out.T
+        return out
 
-        if not np.array_equal(self.board, original_board):
-            self.add_random_tile()
-            self.move_count += 1  # Increment move count
-        else:
-            raise ValueError("Invalid move: No tiles moved or combined.")
+    def _slide_and_merge_row(self, row: np.ndarray) -> Tuple[np.ndarray, int]:
+        """Slide and merge a single row, return (new_row, score_gain)."""
+        non_zero = row[row != 0]
+        out = []
+        score_gain = 0
+        i = 0
+        while i < len(non_zero):
+            if i + 1 < len(non_zero) and non_zero[i] == non_zero[i + 1]:
+                merged_val = non_zero[i] * 2
+                out.append(merged_val)
+                score_gain += merged_val
+                i += 2
+            else:
+                out.append(non_zero[i])
+                i += 1
+        # Pad with zeros
+        while len(out) < len(row):
+            out.append(0)
+        return np.array(out, dtype=int), score_gain
 
-    def is_game_over(self):
-        # Check if any cell is empty
-        if np.any(self.board == 0):
+    def move(self, direction: str) -> bool:
+        """
+        Perform a move in the given direction.
+        Returns True if the move was valid and changed the board, False otherwise.
+        """
+        if direction not in ['up', 'down', 'left', 'right']:
             return False
+
+        # Transform board for left-merge computation
+        vboard, rotated = self._transform(self.board.copy(), direction)
         
-        # Check if any move is possible by looking for adjacent equal tiles
-        # Optimized: check each position only once for both horizontal and vertical matches
-        for i in range(4):
-            for j in range(4):
-                current = self.board[i, j]
-                # Check right neighbor (horizontal match)
-                if j < 3 and current == self.board[i, j + 1]:
-                    return False
-                # Check bottom neighbor (vertical match)
-                if i < 3 and current == self.board[i + 1, j]:
-                    return False
+        # Track if any changes occurred
+        changed = False
+        total_score_gain = 0
+
+        # Process each row
+        for r in range(self.n):
+            old_row = vboard[r].copy()
+            new_row, score_gain = self._slide_and_merge_row(old_row)
+            vboard[r] = new_row
+            total_score_gain += score_gain
+            if not np.array_equal(old_row, new_row):
+                changed = True
+
+        if not changed:
+            return False
+
+        # Transform back to original orientation
+        self.board = self._inverse_transform(vboard, direction, rotated)
+        self.score += total_score_gain
+        self.move_count += 1
+
+        # Add new tile
+        self._add_random_tile()
         return True
 
-    # === Action mask helpers (no side effects) ===
-    def _slide_and_merge_preview(self, row: np.ndarray) -> np.ndarray:
-        """Pure version of slide_and_merge that does not touch score.
-        Used only to check whether a move would change the board.
-        """
-        non_zero = row[row != 0]
-        new_row = []
-        skip = False
-        for i in range(len(non_zero)):
-            if skip:
-                skip = False
-                continue
-            if i < len(non_zero) - 1 and non_zero[i] == non_zero[i + 1]:
-                new_row.append(non_zero[i] * 2)
-                skip = True
-            else:
-                new_row.append(non_zero[i])
-        while len(new_row) < len(row):
-            new_row.append(0)
-        return np.array(new_row)
+    def get_valid_moves(self) -> List[str]:
+        """Return list of valid move directions."""
+        valid_moves = []
+        for direction in ['up', 'down', 'left', 'right']:
+            if self._is_move_possible(direction):
+                valid_moves.append(direction)
+        return valid_moves
 
-    def _preview_board_after_move(self, direction: str) -> np.ndarray:
+    def _is_move_possible(self, direction: str) -> bool:
+        """Check if a move in the given direction is possible."""
         if direction not in ['up', 'down', 'left', 'right']:
-            raise ValueError("Invalid move direction")
-        preview = self.board.copy()
-
-        rotated = False
-        if direction in ['up', 'down']:
-            preview = preview.T
-            rotated = True
-        if direction in ['down', 'right']:
-            preview = np.flip(preview, axis=1)
-        for i in range(4):
-            preview[i] = self._slide_and_merge_preview(preview[i])
-        if direction in ['down', 'right']:
-            preview = np.flip(preview, axis=1)
-        if rotated:
-            preview = preview.T
-        return preview
-
-    def is_move_possible(self, direction: str) -> bool:
-        """Return True if applying direction would change the board."""
-        try:
-            preview = self._preview_board_after_move(direction)
-        except ValueError:
             return False
-        return not np.array_equal(preview, self.board)
 
-    def get_valid_action_mask(self) -> np.ndarray:
-        """Boolean mask for actions [up, down, left, right]."""
-        directions = ['up', 'down', 'left', 'right']
-        mask = [self.is_move_possible(d) for d in directions]
-        return np.array(mask, dtype=bool)
+        # Transform board
+        vboard, rotated = self._transform(self.board.copy(), direction)
+        
+        # Check each row for possible moves
+        for r in range(self.n):
+            row = vboard[r]
+            # Check for slides (zeros before non-zeros)
+            non_zero_indices = np.where(row != 0)[0]
+            if len(non_zero_indices) > 0:
+                # Check if there are zeros before the first non-zero
+                if non_zero_indices[0] > 0:
+                    return True
+                # Check for merges (adjacent equal values)
+                for i in range(len(non_zero_indices) - 1):
+                    if row[non_zero_indices[i]] == row[non_zero_indices[i + 1]]:
+                        return True
+        return False
+
+    def is_game_over(self) -> bool:
+        """Check if the game is over (no valid moves possible)."""
+        return len(self.get_valid_moves()) == 0
+
+    def get_state(self) -> np.ndarray:
+        """Get current board state as numpy array."""
+        return self.board.copy()
+
+    def get_score(self) -> int:
+        """Get current score."""
+        return self.score
+
+    def get_move_count(self) -> int:
+        """Get number of moves made."""
+        return self.move_count
+
+    def reset(self):
+        """Reset the game to initial state."""
+        self.board = np.zeros((self.n, self.n), dtype=int)
+        self.score = 0
+        self.move_count = 0
+        self._add_random_tile()
+        self._add_random_tile()
+
+    # ---------- Simple curses render (for debugging) ----------
 
     def render(self, stdscr, previous_board=None):
         stdscr.clear()
@@ -155,17 +169,20 @@ class Game2048:
             for i, row in enumerate(previous_board):
                 row_str = "|".join(f"{num:4}" if num > 0 else "    " for num in row)
                 stdscr.addstr(i * 2 + 2, 0, f"|{row_str}|")
-                if i < 3:
-                    stdscr.addstr(i * 2 + 3, 0, "+----+----+----+----+")
+                if i < self.n - 1:
+                    stdscr.addstr(i * 2 + 3, 0, "+----" * self.n + "+")
 
         stdscr.addstr(1, 25, "Current Board:")
         for i, row in enumerate(self.board):
             row_str = "|".join(f"{num:4}" if num > 0 else "    " for num in row)
             stdscr.addstr(i * 2 + 2, 25, f"|{row_str}|")
-            if i < 3:
-                stdscr.addstr(i * 2 + 3, 25, "+----+----+----+----+")
+            if i < self.n - 1:
+                stdscr.addstr(i * 2 + 3, 25, "+----" * self.n + "+")
 
         stdscr.refresh()
+
+
+# ---------- CLI runner (for testing) ----------
 
 def main(stdscr):
     curses.curs_set(0)  # Hide the cursor
@@ -184,19 +201,23 @@ def main(stdscr):
     }
 
     game.render(stdscr)
+    previous_board = None
     while not game.is_game_over():
         previous_board = game.board.copy()
         key = stdscr.getch()
         if key in key_mapping:
-            try:
-                game.move(key_mapping[key])
+            if game.move(key_mapping[key]):
                 game.render(stdscr, previous_board=previous_board)
-            except ValueError as e:
-                stdscr.addstr(0, 0, str(e))
         else:
             stdscr.addstr(0, 0, "Invalid input. Use arrow keys or w, a, s, d.")
 
-    stdscr.addstr(0, 0, "Game Over!")
+    # Show final state using existing render method with previous state
+    stdscr.clear()
+    stdscr.addstr(0, 0, "Game Over! Final State:")
+    game.render(stdscr, previous_board=previous_board)
+    stdscr.addstr(game.n * 2 + 3, 0, "\nPress any key to exit...")
+    stdscr.refresh()
+    stdscr.getch()  # Wait for user input before exiting
 
 if __name__ == "__main__":
     curses.wrapper(main)
